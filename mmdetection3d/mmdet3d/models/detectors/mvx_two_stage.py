@@ -26,8 +26,10 @@ class MVXTwoStageDetector(Base3DDetector):
                  pts_middle_encoder=None,
                  pts_fusion_layer=None,
                  img_backbone=None,
+                 aerialimg_backbone=None,
                  pts_backbone=None,
                  img_neck=None,
+                 aerialimg_neck=None,
                  pts_neck=None,
                  pts_bbox_head=None,
                  img_roi_head=None,
@@ -62,8 +64,13 @@ class MVXTwoStageDetector(Base3DDetector):
 
         if img_backbone:
             self.img_backbone = builder.build_backbone(img_backbone)
+        # build (backbone, neck) for aerial images
+        if aerialimg_backbone:
+            self.aerialimg_backbone = builder.build_backbone(aerialimg_backbone)
         if img_neck is not None:
             self.img_neck = builder.build_neck(img_neck)
+        if aerialimg_neck is not None:
+            self.aerialimg_neck = builder.build_neck(aerialimg_neck)
         if img_rpn_head is not None:
             self.img_rpn_head = builder.build_head(img_rpn_head)
         if img_roi_head is not None:
@@ -88,6 +95,8 @@ class MVXTwoStageDetector(Base3DDetector):
                     key, please consider using init_cfg')
                 self.img_backbone.init_cfg = dict(
                     type='Pretrained', checkpoint=img_pretrained)
+                # self.aerialimg_backbone.init_cfg = dict(
+                #     type='Pretrained', checkpoint=img_pretrained)
         if self.with_img_roi_head:
             if img_pretrained is not None:
                 warnings.warn('DeprecationWarning: pretrained is a deprecated \

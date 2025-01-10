@@ -3,6 +3,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange, repeat
 from mmcv.cnn import xavier_init, constant_init
 from mmcv.cnn.bricks.registry import (ATTENTION,
                                       TRANSFORMER_LAYER,
@@ -53,6 +54,7 @@ class GeometrySptialCrossAttention(BaseModule):
         self.embed_dims = embed_dims
         self.num_cams = num_cams
         self.output_proj = nn.Linear(embed_dims, embed_dims)
+        # self.aerial_bev_queries = nn.Embedding(200*200, embed_dims)
         self.batch_first = batch_first
         self.init_weight()
 
@@ -60,13 +62,15 @@ class GeometrySptialCrossAttention(BaseModule):
         """Default initialization for Parameters of Module."""
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
 
-    @force_fp32(apply_to=('query', 'key', 'value', 'query_pos', 'reference_points_cam'))
+    @force_fp32(apply_to=('query', 'key', 'value', 'aerial_feats', 'query_pos', 'reference_points_cam'))
     def forward(self,
                 query,
                 key,
                 value,
+                # aerial_feats,
                 residual=None,
                 query_pos=None,
+                bev_size=None,
                 key_padding_mask=None,
                 reference_points=None,
                 spatial_shapes=None,
@@ -119,7 +123,11 @@ class GeometrySptialCrossAttention(BaseModule):
         if query_pos is not None:
             query = query + query_pos
 
+        # query [4, 40000, 256] / key, value [6, 375, 4, 256 ] / reference_points_cam [6, 4, 40000, 4, 2] / 40000 = bev_h*bev_w
         bs, num_query, _ = query.size()
+        # aerial_query = query.clone().detach()
+        # aerial_query = self.aerial_bev_queries.weight.to(query.dtype)
+        # aerial_query = repeat(aerial_query, '... -> b ...', b=bs)
 
         D = reference_points_cam.size(3)
         indexes = []
@@ -150,8 +158,10 @@ class GeometrySptialCrossAttention(BaseModule):
             bs * self.num_cams, l, self.embed_dims)
 
         queries = self.attention(query=queries_rebatch.view(bs*self.num_cams, max_len, self.embed_dims), key=key, value=value,
-                                 reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2), spatial_shapes=spatial_shapes,
-                                 level_start_index=level_start_index).view(bs, self.num_cams, max_len, self.embed_dims)
+                                bev_size=bev_size, reference_points=reference_points_rebatch.view(bs*self.num_cams, max_len, D, 2),
+                                spatial_shapes=spatial_shapes, level_start_index=level_start_index)
+        queries = queries.view(bs, self.num_cams, max_len, self.embed_dims)
+
         for j in range(bs):
             for i, index_query_per_img in enumerate(indexes):
                 slots[j, index_query_per_img] += queries[j,
@@ -161,6 +171,42 @@ class GeometrySptialCrossAttention(BaseModule):
         count = count.permute(1, 2, 0).sum(-1)
         count = torch.clamp(count, min=1.0)
         slots = slots / count[..., None]
+
+        # print('Min:', torch.min(slots))
+        # print('Max:', torch.max(slots))
+        # print('Mean:', torch.mean(slots))
+        # print('Median:', torch.median(slots))
+        # print('Std:', torch.std(slots))
+        # print('0.5 Q:', torch.quantile(slots[0], 0.5))
+        # print('0.75 Q:', torch.quantile(slots[0], 0.75))
+
+        # slots = (aerial_queries*0)+slots
+
+        # print('pMin:', torch.min(slots))
+        # print('Max:', torch.max(slots))
+        # print('Mean:', torch.mean(slots))
+        # print('Median:', torch.median(slots))
+        # print('Std:', torch.std(slots))
+        # print('0.5 Q:', torch.quantile(slots[0], 0.5))
+        # print('0.75 Q:', torch.quantile(slots[0], 0.75))
+        # import sys
+        # sys.exit()
+
+
+        # print('pMin:', torch.min(slots))
+        # print('pMax:', torch.max(slots))
+        # print('pMean:', torch.mean(slots))
+        # print('pMedian:', torch.median(slots))
+        # print('pStd:', torch.std(slots))
+        # print('p0.5 Q:', torch.quantile(slots[0], 0.5))
+        # print('p0.75 Q:', torch.quantile(slots[0], 0.75))
+        # import sys
+        # sys.exit()
+
+    
+        # slots = (aerial_queries*selection_weights) + slots                            # 2nd test
+        # slots = slots + aerial_queries                                                # 3rd test
+        # slots = (aerial_queries*selection_weights) + slots*(1-selection_weights)      # ideal version??
         slots = self.output_proj(slots)
 
         return self.dropout(slots) + inp_residual
@@ -208,7 +254,7 @@ class GeometryKernelAttention(BaseModule):
         if embed_dims % num_heads != 0:
             raise ValueError(f'embed_dims must be divisible by num_heads, '
                              f'but got {embed_dims} and {num_heads}')
-        dim_per_head = embed_dims // num_heads
+        self.dim_per_head = embed_dims // num_heads
         self.norm_cfg = norm_cfg
         self.batch_first = batch_first
         self.output_proj = None
@@ -223,7 +269,7 @@ class GeometryKernelAttention(BaseModule):
                         n, type(n)))
             return (n & (n - 1) == 0) and n != 0
 
-        if not _is_power_of_2(dim_per_head):
+        if not _is_power_of_2(self.dim_per_head):
             warnings.warn(
                 "You'd better set embed_dims in "
                 'MultiScaleDeformAttention to make '
@@ -244,6 +290,11 @@ class GeometryKernelAttention(BaseModule):
         self.attention_weights = nn.Linear(
             embed_dims, num_levels * self.num_points * self.num_heads)
         self.value_proj = nn.Linear(embed_dims, embed_dims)
+        # self.aerial_proj = nn.Linear(embed_dims, embed_dims)
+        # self.aerial_attention_weights = nn.Linear(
+        #     embed_dims, num_levels * self.num_points * self.num_heads)
+
+        # self.bev_selection_weights = nn.Linear(embed_dims, 1)
 
         grid_h, grid_w = kernel_size
         y = (torch.arange(grid_h) - grid_h // 2) * dilation
@@ -252,6 +303,50 @@ class GeometryKernelAttention(BaseModule):
             torch.meshgrid(x, y)).permute(1, 2, 0).reshape(grid_h * grid_w, 2)
         self.register_buffer("grid_offsets", offsets, persistent=False)
         self.init_weights()
+
+    #     bev_height, bev_width = 200, 200
+    #     h_meters, w_meters = 100, 100
+    #     bev_grid = self.generate_grid(bev_height, bev_width).squeeze(0)
+    #     bev_grid[0] = bev_width * bev_grid[0]
+    #     bev_grid[1] = bev_height * bev_grid[1]
+
+    #     # map from bev coordinates to ego frame
+    #     V = self.get_view_matrix(bev_height, bev_width,
+    #                         h_meters, w_meters, 0.0)  # 3 3
+    #     V_inv = torch.FloatTensor(V).inverse()  # 3 3
+    #     # 3 (h w)
+    #     bev_grid = V_inv @ rearrange(bev_grid, 'd h w -> d (h w)')
+    #     self.bev_grid = rearrange(bev_grid, 'd (h w) -> d h w', h=bev_height, w=bev_width)    
+
+    #     self.bev_pos = nn.Conv2d(2, embed_dims, 1)
+
+    # @staticmethod
+    # def generate_grid(height: int, width: int):
+    #     xs = torch.linspace(0, 1, width)
+    #     ys = torch.linspace(0, 1, height)
+
+    #     indices = torch.stack(torch.meshgrid(
+    #         (xs, ys), indexing='xy'), 0)       # 2 h w
+    #     indices = F.pad(indices, (0, 0, 0, 0, 0, 1),
+    #                     value=1)                   # 3 h w
+    #     # 1 3 h w
+    #     indices = indices[None]
+
+    #     return indices
+
+    # @staticmethod
+    # def get_view_matrix(h=200, w=200, h_meters=100.0, w_meters=100.0, offset=0.0):
+    #     """
+    #     copied from ..data.common but want to keep models standalone
+    #     """
+    #     sh = h / h_meters
+    #     sw = w / w_meters
+
+    #     return [
+    #         [0., -sw,          w/2.],
+    #         [-sh,  0., h*offset+h/2.],
+    #         [0.,  0.,            1.]
+    #     ]
 
     def init_weights(self):
         """Default initialization for Parameters of Module."""
@@ -269,7 +364,10 @@ class GeometryKernelAttention(BaseModule):
 
         # self.sampling_offsets.bias.data = grid_init.view(-1)
         constant_init(self.attention_weights, val=0., bias=0.)
+        # constant_init(self.aerial_attention_weights, val=0., bias=0.)
+        # constant_init(self.bev_selection_weights, val=0., bias=0.)
         xavier_init(self.value_proj, distribution='uniform', bias=0.)
+        # xavier_init(self.aerial_proj, distribution='uniform', bias=0.)
         xavier_init(self.output_proj, distribution='uniform', bias=0.)
         self._is_init = True
 
@@ -353,10 +451,62 @@ class GeometryKernelAttention(BaseModule):
         # print('x;', output.shape)
         return output.view(bs, num_queries, -1)
 
+    def aerial_attention(self, bev_size, feat, attention_weights):
+        h, w = bev_size
+        b, c, aH, aW = feat.shape
+
+        with torch.no_grad():
+            xs = torch.linspace(0, 1, w, requires_grad=False)
+            ys = torch.linspace(0, 1, h, requires_grad=False)
+
+            # 2 h w -> b k 2 // k=h*w 
+            sample_points = torch.stack(torch.meshgrid(
+            (xs, ys), indexing='xy'), 0).requires_grad_(False).to(feat.device)  # 2 h w
+
+            sample_points[0] *= aW
+            sample_points[1] *= aH
+            sample_points = repeat(sample_points, '... -> b ...', b=b)
+            sample_points = rearrange(sample_points, 'b c h w -> b (h w) c')
+            sample_points = sample_points.round().long()
+
+            num_grid_points = self.kernel_size[0] * self.kernel_size[1]
+            grid_offsets = self.grid_offsets.view(1, 1, num_grid_points, 2)
+            # (b, k, 1, 2) + (1, 1, 9, 2) = (b, k, 9, 2) // 9 -> kernel_h*kernel_w
+            sample_points = sample_points.unsqueeze(-2) + grid_offsets
+            sample_points[..., 0].clamp_(min=0, max=aW-1)
+            sample_points[..., 1].clamp_(min=0, max=aH-1)
+
+            k = sample_points.shape[1]
+            sample_points_inds = sample_points[..., 0] + sample_points[..., 1] * aW
+            # [b, (k*9)]
+            sample_points_inds = sample_points_inds.view(
+                b, k * num_grid_points)
+            # batch offset
+            ind_offsets = (torch.arange(b, device=feat.device)
+                        * (aH * aW)).view(b, 1)    
+            sample_points_inds = (sample_points_inds + ind_offsets).view(-1)
+        
+        feat = rearrange(feat, 'b c h w -> (b h w) c')
+        sampled_feats = feat[sample_points_inds].reshape(
+            b, k, self.num_levels*num_grid_points, c)
+        sampled_feats = rearrange(sampled_feats, 'b k g (h d) -> b h k g d', h=self.num_heads, d=self.dim_per_head)
+
+        attention_weights = attention_weights.transpose(1, 2).contiguous().view(
+            b, self.num_heads, k, self.num_levels * self.num_points, 1)
+        
+        output = (sampled_feats *
+                  attention_weights).sum(-2).transpose(1, 2).contiguous()
+        output = output.view(b, k, -1)
+
+        return output
+    
     def forward(self,
                 query,
                 key=None,
                 value=None,
+                # aerial_feats=None,
+                # aerial_query=None,
+                bev_size=None,
                 identity=None,
                 query_pos=None,
                 key_padding_mask=None,
@@ -412,12 +562,27 @@ class GeometryKernelAttention(BaseModule):
 
         bs, num_query, _ = query.shape
         bs, num_value, _ = value.shape
+        # _, _, aerial_h, aerial_w = aerial_feats.shape
+
+        # b, num_aerial, _ = aerial_query.shape
+        # bev_grid = self.bev_grid[:2].to(query.device)
+        # # only x,y
+        # bev_grid = repeat(bev_grid, '... -> b ...', b=b)
+        # _, _, h, w = bev_grid.shape
+        # aerial_pos = self.bev_pos(bev_grid)
+        # aerial_pos = aerial_pos / (aerial_pos.norm(dim=1, keepdim=True) + 1e-7)
+        # aerial_pos = rearrange(aerial_pos, 'b d h w -> b (h w) d', h=h, w=w)
+        # aerial_query = aerial_query + aerial_pos
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
         value = self.value_proj(value)
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], 0.0)
         value = value.view(bs, num_value, self.num_heads, -1)
+
+        # aerial_feats = self.aerial_proj(rearrange(aerial_feats, 'b c h w -> b (h w) c'))
+        # aerial_feats = rearrange(aerial_feats, 'b (h w) c -> b c h w', h=aerial_h, w=aerial_w)
+
         # sampling_offsets = self.sampling_offsets(query).view(
         #     bs, num_query, self.num_heads, self.num_levels, self.num_points, 2)
 
@@ -432,6 +597,18 @@ class GeometryKernelAttention(BaseModule):
                                                    self.num_heads,
                                                    self.num_levels,
                                                    self.num_points)
+        
+        # aerial_attention_weights = self.aerial_attention_weights(aerial_query).view(
+        #     b, num_aerial, self.num_heads, self.num_levels * self.num_points)
+        
+        # aerial_attention_weights = aerial_attention_weights.softmax(-1)
+
+        # aerial_attention_weights = aerial_attention_weights.view(b, num_aerial,
+        #                                                          self.num_heads,
+        #                                                          self.num_levels,
+        #                                                          self.num_points)
+        
+        # bev_selection_weights = F.sigmoid(self.bev_selection_weights(aerial_query))
 
         if reference_points.shape[-1] == 2:
             """
@@ -487,6 +664,8 @@ class GeometryKernelAttention(BaseModule):
         output = GeometricKernelAttentionFunc.apply(
             value, spatial_shapes, level_start_index, sampling_locations.contiguous(), attention_weights, self.im2col_step
         )
+
+        # aerial_output = self.aerial_attention(bev_size, aerial_feats, aerial_attention_weights)
         # if torch.cuda.is_available() and value.is_cuda:
         #     if value.dtype == torch.float16:
         #         MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
@@ -503,4 +682,5 @@ class GeometryKernelAttention(BaseModule):
         # torch.cuda.synchronize()
         # end = time.perf_counter()
         # print("geometric kernel attention: {:.3f} ms".format((end-start)*1000))
+        # return output, aerial_output, bev_selection_weights
         return output

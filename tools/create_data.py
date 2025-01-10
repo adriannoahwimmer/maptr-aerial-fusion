@@ -53,6 +53,7 @@ def nuscenes_data_prep(root_path,
                        can_bus_root_path,
                        info_prefix,
                        version,
+                       custom_split,
                        dataset_name,
                        out_dir,
                        max_sweeps=10):
@@ -70,18 +71,18 @@ def nuscenes_data_prep(root_path,
         max_sweeps (int): Number of input consecutive frames. Default: 10
     """
     nuscenes_converter.create_nuscenes_infos(
-        root_path, out_dir, can_bus_root_path, info_prefix, version=version, max_sweeps=max_sweeps)
+        root_path, out_dir, can_bus_root_path, info_prefix, version=version, custom_split=custom_split, max_sweeps=max_sweeps)
 
     if version == 'v1.0-test':
         info_test_path = osp.join(
-            out_dir, f'{info_prefix}_infos_temporal_test.pkl')
+            out_dir, f'{info_prefix}_infos_temporal_test-original.pkl')
         nuscenes_converter.export_2d_annotation(
             root_path, info_test_path, version=version)
     else:
         info_train_path = osp.join(
-            out_dir, f'{info_prefix}_infos_temporal_train.pkl')
+            out_dir, f'{info_prefix}_infos_temporal_train-original.pkl')
         info_val_path = osp.join(
-            out_dir, f'{info_prefix}_infos_temporal_val.pkl')
+            out_dir, f'{info_prefix}_infos_temporal_val-original.pkl')
         nuscenes_converter.export_2d_annotation(
             root_path, info_train_path, version=version)
         nuscenes_converter.export_2d_annotation(
@@ -226,9 +227,30 @@ parser.add_argument(
 parser.add_argument('--extra-tag', type=str, default='kitti')
 parser.add_argument(
     '--workers', type=int, default=4, help='number of threads to be used')
+parser.add_argument(
+    '--custom_split', type=bool, default=False, required=False, help='custom trainval split'
+    )
+parser.add_argument(
+    '--trainsplit', type=str, default=None, required=False, help='custom train split'
+    )
+parser.add_argument(
+    '--valsplit', type=str, default=None, required=False, help='custom val split'
+    )
 args = parser.parse_args()
 
 if __name__ == '__main__':
+    if args.custom_split is True:
+        assert(args.trainsplit is not None)
+        assert(args.valsplit is not None)
+        class customsplit:
+            train = []
+            val = []
+        with open(args.trainsplit, 'r') as a:
+            customsplit.train = a.read().split('\n')
+        with open(args.valsplit, 'r') as b:
+            customsplit.val = b.read().split('\n')
+    else:
+        customsplit = None
     if args.dataset == 'kitti':
         kitti_data_prep(
             root_path=args.root_path,
@@ -242,6 +264,7 @@ if __name__ == '__main__':
             can_bus_root_path=args.canbus,
             info_prefix=args.extra_tag,
             version=train_version,
+            custom_split = customsplit,
             dataset_name='NuScenesDataset',
             out_dir=args.out_dir,
             max_sweeps=args.max_sweeps)

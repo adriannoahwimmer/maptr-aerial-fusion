@@ -6,9 +6,15 @@ from mmdet.models import DETECTORS
 from mmdet3d.core import bbox3d2result
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
 from projects.mmdet3d_plugin.models.utils.grid_mask import GridMask
+from projects.mmdet3d_plugin.models.utils.predimg import pred_img
 from mmcv.runner import force_fp32, auto_fp16
 from mmdet3d.ops import Voxelization, DynamicScatter
 from mmdet3d.models import builder
+from mmcv.cnn import ConvModule
+import torch.distributed as dist
+from collections import OrderedDict
+import numpy as np
+
 @DETECTORS.register_module()
 class MapTR(MVXTwoStageDetector):
     """MapTR.
@@ -23,8 +29,10 @@ class MapTR(MVXTwoStageDetector):
                  pts_middle_encoder=None,
                  pts_fusion_layer=None,
                  img_backbone=None,
+                 aerialimg_backbone=None,
                  pts_backbone=None,
                  img_neck=None,
+                 aerialimg_neck=None,
                  pts_neck=None,
                  pts_bbox_head=None,
                  img_roi_head=None,
@@ -40,7 +48,8 @@ class MapTR(MVXTwoStageDetector):
         super(MapTR,
               self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
-                             img_backbone, pts_backbone, img_neck, pts_neck,
+                             img_backbone, aerialimg_backbone, pts_backbone,
+                             img_neck, aerialimg_neck, pts_neck,
                              pts_bbox_head, img_roi_head, img_rpn_head,
                              train_cfg, test_cfg, pretrained)
         self.grid_mask = GridMask(
@@ -70,11 +79,22 @@ class MapTR(MVXTwoStageDetector):
             )
             self.voxelize_reduce = lidar_encoder.get("voxelize_reduce", True)
 
+        # conv layers for fusing feature pyramids
+        self.lateral_convs = nn.ModuleList()
+        for i in range(5):
+            self.lateral_convs.append(
+                ConvModule(
+                    256,
+                    256,
+                    1,
+                    conv_cfg=None,
+                    norm_cfg=None,
+                    inplace=False))
 
-    def extract_img_feat(self, img, img_metas, len_queue=None):
+    def extract_img_feat(self, img, aerialimg, img_metas, len_queue=None):
         """Extract features of images."""
         B = img.size(0)
-        if img is not None:
+        if img is not None and aerialimg is not None:
             
             # input_shape = img.shape[-2:]
             # # update real input shape of each single img
@@ -90,12 +110,33 @@ class MapTR(MVXTwoStageDetector):
                 img = self.grid_mask(img)
 
             img_feats = self.img_backbone(img)
+            aerial_feats = self.aerialimg_backbone(aerialimg)
             if isinstance(img_feats, dict):
                 img_feats = list(img_feats.values())
         else:
-            return None
+            return None, None
         if self.with_img_neck:
             img_feats = self.img_neck(img_feats)
+            aerial_feats = self.aerialimg_neck(aerial_feats)
+
+        '''FusedSemanticHead (https://github.com/csuhan/s2anet/blob/master/mmdet/models/mask_heads/fused_semantic_head.py#L11)
+        eg: aerial_feats is a list of shapes:
+            torch.Size([4, 256, 101, 51]) 0
+            torch.Size([4, 256, 51, 26])  1
+            torch.Size([4, 256, 26, 13])  2
+            torch.Size([4, 256, 13, 7])  3
+            torch.Size([4, 256, 7, 4])  4
+        '''
+        fusion_level = 0
+        x = self.lateral_convs[fusion_level](aerial_feats[fusion_level])
+        fused_size = tuple(x.shape[-2:])
+        for i, feat in enumerate(aerial_feats):
+            if i != fusion_level:
+                feat = F.interpolate(
+                    feat, size=fused_size, mode='bilinear', align_corners=True)
+                add = self.lateral_convs[i](feat) # autograd issue with inplace operation
+                x = x+add
+        aerial_feats = x
 
         img_feats_reshaped = []
         for img_feat in img_feats:
@@ -104,19 +145,20 @@ class MapTR(MVXTwoStageDetector):
                 img_feats_reshaped.append(img_feat.view(int(B/len_queue), len_queue, int(BN / B), C, H, W))
             else:
                 img_feats_reshaped.append(img_feat.view(B, int(BN / B), C, H, W))
-        return img_feats_reshaped
+        return img_feats_reshaped, aerial_feats
 
     @auto_fp16(apply_to=('img'), out_fp32=True)
-    def extract_feat(self, img, img_metas=None, len_queue=None):
+    def extract_feat(self, img, aerialimg, img_metas=None, len_queue=None):
         """Extract features from images and points."""
 
-        img_feats = self.extract_img_feat(img, img_metas, len_queue=len_queue)
+        img_feats, aerial_feats = self.extract_img_feat(img, aerialimg, img_metas, len_queue=len_queue)
         
-        return img_feats
+        return img_feats, aerial_feats
 
 
     def forward_pts_train(self,
                           pts_feats,
+                          aerial_feats,
                           lidar_feat,
                           gt_bboxes_3d,
                           gt_labels_3d,
@@ -139,10 +181,10 @@ class MapTR(MVXTwoStageDetector):
         """
 
         outs = self.pts_bbox_head(
-            pts_feats, lidar_feat, img_metas, prev_bev)
+            pts_feats, aerial_feats, lidar_feat, img_metas, prev_bev)
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
         losses = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
-        return losses
+        return losses, outs
 
     def forward_dummy(self, img):
         dummy_metas = None
@@ -231,6 +273,7 @@ class MapTR(MVXTwoStageDetector):
                       gt_labels=None,
                       gt_bboxes=None,
                       img=None,
+                      aerialimg=None,
                       proposals=None,
                       gt_bboxes_ignore=None,
                       img_depth=None,
@@ -275,16 +318,33 @@ class MapTR(MVXTwoStageDetector):
         img_metas = [each[len_queue-1] for each in img_metas]
         if not img_metas[0]['prev_bev_exists']:
             prev_bev = None
-        img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        img_feats, aerial_feats = self.extract_feat(img=img, aerialimg=aerialimg, img_metas=img_metas)
         losses = dict()
-        losses_pts = self.forward_pts_train(img_feats, lidar_feat, gt_bboxes_3d,
+        losses_pts, outs = self.forward_pts_train(img_feats, aerial_feats, lidar_feat, gt_bboxes_3d,
                                             gt_labels_3d, img_metas,
                                             gt_bboxes_ignore, prev_bev)
 
         losses.update(losses_pts)
+
+        # put the images to be logged here -->
+        with torch.no_grad():
+            ret_bbox_list = [dict() for i in range(len(img_metas))]
+            bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas, rescale=True)
+
+            bbox_results = [
+            self.pred2result(bboxes, scores, labels, pts)
+            for bboxes, scores, labels, pts in bbox_list]
+
+            for result_dict, pts_bbox in zip(ret_bbox_list, bbox_results):
+                result_dict['pts_bbox'] = pts_bbox
+
+        logimg = pred_img(img, aerialimg, ret_bbox_list, self.pts_bbox_head.pc_range)
+        img_ = {'img': logimg}
+        losses.update(img_)
+
         return losses
 
-    def forward_test(self, img_metas, img=None,points=None,  **kwargs):
+    def forward_test(self, img_metas, img=None, aerialimg=None, points=None,  **kwargs):
         for var, name in [(img_metas, 'img_metas')]:
             if not isinstance(var, list):
                 raise TypeError('{} must be a list, but got {}'.format(
@@ -311,13 +371,17 @@ class MapTR(MVXTwoStageDetector):
             img_metas[0][0]['can_bus'][-1] = 0
             img_metas[0][0]['can_bus'][:3] = 0
 
+        # simple_test expects the args to be nested in a list... why? no idea...
         new_prev_bev, bbox_results = self.simple_test(
-            img_metas[0], img[0], points[0], prev_bev=self.prev_frame_info['prev_bev'], **kwargs)
+            img_metas[0], img[0], aerialimg[0], points[0], prev_bev=self.prev_frame_info['prev_bev'], **kwargs)
         # During inference, we save the BEV features and ego motion of each timestamp.
         self.prev_frame_info['prev_pos'] = tmp_pos
         self.prev_frame_info['prev_angle'] = tmp_angle
         self.prev_frame_info['prev_bev'] = new_prev_bev
-        return bbox_results
+        
+        # EvalHook validates with batch size of 1
+        logimg = pred_img(img[0].unsqueeze(0), aerialimg[0], bbox_results, self.pts_bbox_head.pc_range)
+        return bbox_results, logimg
 
     def pred2result(self, bboxes, scores, labels, pts, attrs=None):
         """Convert detection results to a list of numpy arrays.
@@ -347,9 +411,9 @@ class MapTR(MVXTwoStageDetector):
             result_dict['attrs_3d'] = attrs.cpu()
 
         return result_dict
-    def simple_test_pts(self, x, lidar_feat, img_metas, prev_bev=None, rescale=False):
+    def simple_test_pts(self, x, aerial_feats, lidar_feat, img_metas, prev_bev=None, rescale=False):
         """Test function"""
-        outs = self.pts_bbox_head(x, lidar_feat, img_metas, prev_bev=prev_bev)
+        outs = self.pts_bbox_head(x, aerial_feats, lidar_feat, img_metas, prev_bev=prev_bev)
 
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
@@ -360,20 +424,99 @@ class MapTR(MVXTwoStageDetector):
         ]
         # import pdb;pdb.set_trace()
         return outs['bev_embed'], bbox_results
-    def simple_test(self, img_metas, img=None, points=None, prev_bev=None, rescale=False, **kwargs):
+    def simple_test(self, img_metas, img=None, aerialimg=None, points=None, prev_bev=None, rescale=False, **kwargs):
         """Test function without augmentaiton."""
         lidar_feat = None
         if self.modality =='fusion':
             lidar_feat = self.extract_lidar_feat(points)
-        img_feats = self.extract_feat(img=img, img_metas=img_metas)
+        img_feats, aerial_feats = self.extract_feat(img=img, aerialimg=aerialimg, img_metas=img_metas)
 
         bbox_list = [dict() for i in range(len(img_metas))]
         new_prev_bev, bbox_pts = self.simple_test_pts(
-            img_feats, lidar_feat, img_metas, prev_bev, rescale=rescale)
+            img_feats, aerial_feats, lidar_feat, img_metas, prev_bev, rescale=rescale)
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
         return new_prev_bev, bbox_list
 
+    def _parse_losses(self, losses):
+        """Parse the raw outputs (losses) of the network.
+
+        Args:
+            losses (dict): Raw output of the network, which usually contain
+                losses and other necessary infomation.
+
+        Returns:
+            tuple[Tensor, dict]: (loss, log_vars), loss is the loss tensor \
+                which may be a weighted sum of all losses, log_vars contains \
+                all the variables to be sent to the logger.
+        """
+        log_vars = OrderedDict()
+        for loss_name, loss_value in losses.items():
+            if isinstance(loss_value, torch.Tensor):
+                log_vars[loss_name] = loss_value.mean()
+            elif isinstance(loss_value, list):
+                log_vars[loss_name] = sum(_loss.mean() for _loss in loss_value)
+            # img has to be a numpy array and not a torch.Tensor to skip through
+            elif isinstance(loss_value, np.ndarray):
+                log_vars[loss_name] = loss_value
+            else:
+                raise TypeError(
+                    f'{loss_name} is not a tensor or list of tensors')
+
+        loss = sum(_value for _key, _value in log_vars.items()
+                   if 'loss' in _key)
+
+        log_vars['loss'] = loss
+        for loss_name, loss_value in log_vars.items():
+            # img has to be a numpy array and not a torch.Tensor to skip through
+            if isinstance(loss_value, np.ndarray):
+                continue
+            # reduce loss when distributed training
+            if dist.is_available() and dist.is_initialized():
+                loss_value = loss_value.data.clone()
+                dist.all_reduce(loss_value.div_(dist.get_world_size()))
+            log_vars[loss_name] = loss_value.item()
+
+        return loss, log_vars
+
+    def train_step(self, data, optimizer):
+        """The iteration step during training.
+
+        This method defines an iteration step during training, except for the
+        back propagation and optimizer updating, which are done in an optimizer
+        hook. Note that in some complicated cases or models, the whole process
+        including back propagation and optimizer updating is also defined in
+        this method, such as GAN.
+
+        Args:
+            data (dict): The output of dataloader.
+            optimizer (:obj:`torch.optim.Optimizer` | dict): The optimizer of
+                runner is passed to ``train_step()``. This argument is unused
+                and reserved.
+
+        Returns:
+            dict: It should contain at least 3 keys: ``loss``, ``log_vars``, \
+                ``num_samples``.
+
+                - ``loss`` is a tensor for back propagation, which can be a \
+                weighted sum of multiple losses.
+                - ``log_vars`` contains all the variables to be sent to the
+                logger.
+                - ``num_samples`` indicates the batch size (when the model is \
+                DDP, it means the batch size on each GPU), which is used for \
+                averaging the logs.
+        """
+        losses = self(**data)
+        loss, log_vars = self._parse_losses(losses)
+
+        # images to be logged
+        img = log_vars['img']
+        del log_vars['img']
+
+        outputs = dict(
+            loss=loss, log_vars=log_vars, img=img, num_samples=len(data['img_metas']))
+
+        return outputs
 
 @DETECTORS.register_module()
 class MapTR_fp16(MapTR):

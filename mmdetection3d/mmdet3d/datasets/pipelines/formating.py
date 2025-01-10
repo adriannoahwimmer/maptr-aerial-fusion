@@ -19,6 +19,7 @@ class DefaultFormatBundle(object):
     These fields are formatted as follows.
 
     - img: (1)transpose, (2)to tensor, (3)to DataContainer (stack=True)
+    - aerialimg: (1)transpose, (2)to tensor, (3)to DataContainer (stack=True)
     - proposals: (1)to tensor, (2)to DataContainer
     - gt_bboxes: (1)to tensor, (2)to DataContainer
     - gt_bboxes_ignore: (1)to tensor, (2)to DataContainer
@@ -50,6 +51,9 @@ class DefaultFormatBundle(object):
             else:
                 img = np.ascontiguousarray(results['img'].transpose(2, 0, 1))
                 results['img'] = DC(to_tensor(img), stack=True)
+        if 'aerialimg' in results:
+            aerialimg = np.ascontiguousarray(results['aerialimg'].transpose(2, 0, 1))
+            results['aerialimg'] = DC(to_tensor(aerialimg), stack=True)
         for key in [
                 'proposals', 'gt_bboxes', 'gt_bboxes_ignore', 'gt_labels',
                 'gt_labels_3d', 'attr_labels', 'pts_instance_mask',

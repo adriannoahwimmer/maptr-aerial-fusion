@@ -14,20 +14,342 @@ from projects.mmdet3d_plugin.bevformer.modules.spatial_cross_attention import MS
 from projects.mmdet3d_plugin.bevformer.modules.decoder import CustomMSDeformableAttention
 from .builder import build_fuser, FUSERS
 from typing import List
+import torch.nn.init as init
 
 @FUSERS.register_module()
-class ConvFuser(nn.Sequential):
-    def __init__(self, in_channels: int, out_channels: int) -> None:
+class DynamicWeightSumFuser(nn.Module):
+
+    def __init__(self, in_channels: int, out_channels: int, width: int = 200, length: int = 100) -> None:
+        super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        super().__init__(
-            nn.Conv2d(sum(in_channels), out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(True),
-        )
+        self.width = width
+        self.length = length
+
+        # Convolutional layer to generate fusion weights
+        # Kernel size is 3x3 with padding to keep spatial dimensions consistent
+        self.dynamic_conv = nn.Conv2d(256, out_channels, kernel_size=3, stride=1, padding=1)
+        #keine batchnorm
+        # Activation function to normalize weights to range [0, 1]
+        self.sigmoid = nn.Sigmoid()
+
+        print(f"Initialized DynamicConvFuser with input_channels: {self.in_channels}, output_channels: {self.out_channels}")
 
     def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
-        return super().forward(torch.cat(inputs, dim=1))
+        # Assign input features to respective variables
+        bev_embed, aerial_feature = inputs
+
+        # Rescale Aerial Features to match the BEV Embed statistics
+        # Calculate BEV statistics
+        bev_mean = bev_embed.mean(dim=(0, 1, 2, 3), keepdim=True)  # Mean over batch, height, and width
+        bev_std = bev_embed.std(dim=(0, 1, 2, 3), keepdim=True)    # Std over batch, height, and width
+
+        # Calculate Aerial statistics
+        aerial_mean = aerial_feature.mean(dim=(0,1, 2, 3), keepdim=True)
+        aerial_std = aerial_feature.std(dim=(0, 1, 2, 3), keepdim=True)
+
+        # Normalize and rescale Aerial Features
+        aerial_feature_scaled = (aerial_feature - aerial_mean) / (aerial_std + 1e-6)  # Normalize
+        aerial_feature_scaled = aerial_feature_scaled * bev_std + bev_mean           # Rescale
+
+        # Generate fusion weights using a convolutional layer on BEV Embed
+        conv_fusion_weights = self.dynamic_conv(bev_embed)  # Output shape: [batch, out_channels, width, length]
+        conv_fusion_weights = self.sigmoid(conv_fusion_weights)   # Normalize to range [0, 1]
+
+        # Perform the fusion
+        weighted_bev_embed = conv_fusion_weights * bev_embed
+        weighted_aerial_feature = (1 - conv_fusion_weights) * aerial_feature_scaled
+
+        # Calculate the fused feature
+        fused_feature = weighted_bev_embed + weighted_aerial_feature
+      
+
+        return fused_feature
+
+
+@FUSERS.register_module()
+class AdvancedDynamicConvFuser(nn.Module):
+
+    def __init__(self, in_channels: int, out_channels: int, width: int = 200, length: int = 100) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.width = width
+        self.length = length
+
+        # Convolutional layer to generate initial fusion weights
+        self.initial_conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.sigmoid = nn.Sigmoid()
+
+
+        # Convolutional layer to combine weighted features
+        self.combine_conv = nn.Conv2d(2 * out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        #batch norm und aktivu
+        #nn.BatchNorm2d(out_channels),
+        #nn.ReLU(True),
+
+
+        print(f"Initialized AdvancedDynamicConvFuser with input_channels: {self.in_channels}, output_channels: {self.out_channels}")
+
+    def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+        # Assign input features to respective variables
+        bev_embed, aerial_feature = inputs
+
+        # Calculate BEV statistics and rescale aerial features
+        bev_mean = bev_embed.mean(dim=(0, 1, 2, 3), keepdim=True)
+        bev_std = bev_embed.std(dim=(0, 1, 2, 3), keepdim=True)
+        aerial_mean = aerial_feature.mean(dim=(0, 1, 2, 3), keepdim=True)
+        aerial_std = aerial_feature.std(dim=(0, 1, 2, 3), keepdim=True)
+        aerial_feature_scaled = (aerial_feature - aerial_mean) / (aerial_std + 1e-6)
+        aerial_feature_scaled = aerial_feature_scaled * bev_std + bev_mean
+
+        # Generate initial fusion weights
+        conv_fusion_weights = self.initial_conv(bev_embed)
+        conv_fusion_weights = self.sigmoid(conv_fusion_weights)
+
+        # Apply weights to BEV and aerial features
+        weighted_bev_embed = conv_fusion_weights * bev_embed
+        weighted_aerial_feature = (1 - conv_fusion_weights) * aerial_feature_scaled
+
+        # Concatenate weighted features along channel dimension
+        combined_features = torch.cat([weighted_bev_embed, weighted_aerial_feature], dim=1)
+
+        # Use convolution to fuse combined features
+        fused_feature = self.combine_conv(combined_features)
+
+        return fused_feature
+
+
+
+
+class PositionalEncoding2D(nn.Module):
+    def __init__(self, channels, height, width):
+        super(PositionalEncoding2D, self).__init__()
+        self.channels = channels // 2 * 2  # ensure even number of channels
+        self.height = height
+        self.width = width
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, self.channels, 2).float() / self.channels))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, tensor):
+        device = tensor.device
+        pos_x = torch.arange(self.height, device=device).float()
+        pos_y = torch.arange(self.width, device=device).float()
+        sin_inp_x = torch.einsum("i,j->ij", pos_x, self.inv_freq).view(self.height, 1, -1)
+        sin_inp_y = torch.einsum("i,j->ij", pos_y, self.inv_freq).view(1, self.width, -1)
+        pos_emb = torch.cat((torch.sin(sin_inp_x), torch.cos(sin_inp_x), torch.sin(sin_inp_y), torch.cos(sin_inp_y)), dim=-1)
+        pos_emb = pos_emb.permute(2, 0, 1).unsqueeze(0)
+        pos_emb = pos_emb.repeat(tensor.shape[0], 1, 1, 1)
+        return pos_emb
+
+class ConvFuser(nn.Module):
+    def __init__(self, in_channels, out_channels, width, height, num_heads):
+        super().__init__()
+        self.pos_enc = PositionalEncoding2D(in_channels, width, height)
+        self.conv_q = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv_k = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.conv_v = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.multihead_attn = nn.MultiheadAttention(out_channels, num_heads)
+
+    def forward(self, bev_embed, aerial_feature):
+        # Add positional encoding
+        bev_embed_pos_enc = self.pos_enc(bev_embed)
+        aerial_feature_pos_enc = self.pos_enc(aerial_feature)
+
+        # Generate queries, keys, values
+        q = self.conv_q(aerial_feature_pos_enc)
+        k = self.conv_k(bev_embed_pos_enc)
+        v = self.conv_v(bev_embed_pos_enc)
+
+        # Reshape and permute for multihead attention
+        batch_size = q.size(0)
+        q = q.view(batch_size, self.out_channels, -1)
+        k = k.view(batch_size, self.out_channels, -1)
+        v = v.view(batch_size, self.out_channels, -1)
+
+        # Apply multihead attention
+        attn_output, _ = self.multihead_attn(q, k, v)
+        attn_output = attn_output.view(batch_size, self.out_channels, self.width, self.height)
+
+        return attn_output
+
+
+
+
+
+
+
+
+
+
+
+#cwl_fusion
+@FUSERS.register_module()
+class CWLFuser(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, width: int = 200, length: int = 100) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.width = width
+        self.length = length
+
+        # Define a learnable fusion weight tensor with shape (out_channels, width, length)
+        # Xavier initialization to keep the weights in a suitable range
+        self.fusion_weight_tensor = nn.Parameter(torch.empty((out_channels, width, length)))
+        init.xavier_uniform_(self.fusion_weight_tensor)  # Apply Xavier initialization
+
+        # BatchNorm for Aerial Features
+        #self.aerial_bn = nn.BatchNorm2d(num_features=in_channels)
+
+        print(f"Initialized CWLFuser with Xavier-initialized fusion weight tensor of shape {self.fusion_weight_tensor.shape}")
+        print(f"in_channels: {self.in_channels}, out_channels: {self.out_channels}")
+        print("F1")
+
+    def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+        # Assign input features to respective variables for clarity
+        bev_embed, aerial_feature = inputs
+
+
+        # Calculate BEV statistics
+        bev_mean = bev_embed.mean(dim=(0, 1, 2, 3), keepdim=True)  # Mean over batch, height, and width
+        bev_std = bev_embed.std(dim=(0, 1, 2, 3), keepdim=True)    # Std over batch, height, and width
+
+        # Calculate Aerial statistics
+        aerial_mean = aerial_feature.mean(dim=(0, 1, 2, 3), keepdim=True)
+        aerial_std = aerial_feature.std(dim=(0, 1, 2, 3), keepdim=True)
+
+        # Normalize and rescale Aerial Features
+        aerial_feature_scaled = (aerial_feature - aerial_mean) / (aerial_std + 1e-6)  # Normalize 1e−6 wird hinzugefügt, um Division durch Null zu vermeiden, falls die Standardabweichung sehr klein ist.
+        aerial_feature_scaled = aerial_feature_scaled * bev_std + bev_mean  # Rescale to BEV's stats
+        
+        # Expand `fusion_weight_tensor` to match the shape of `bev_embed` and `aerial_feature` (batch dimension added)
+        fusion_weight_map = self.fusion_weight_tensor.view(1, self.out_channels, self.width, self.length)
+                
+        # Perform weighted fusion
+        bev_weighted_features = fusion_weight_map * bev_embed
+        aerial_weighted_features = (1 - fusion_weight_map) * aerial_feature_scaled
+        fused_feature = bev_weighted_features + aerial_weighted_features
+
+        # Debugging information
+        #print(f"BEV Embed Mean: {bev_mean.flatten().mean().item():.4f}, Std: {bev_std.flatten().mean().item():.4f}")
+        #print(f"Aerial Features Mean (before scaling): {aerial_mean.flatten().mean().item():.4f}, Std: {aerial_std.flatten().mean().item():.4f}")
+        #print(f"Aerial Features Mean (after scaling): {aerial_feature_scaled.mean().item():.4f}, Std: {aerial_feature_scaled.std().item():.4f}")
+
+      
+
+        #print("G5")         
+        return fused_feature
+
+
+
+
+
+
+
+
+
+
+
+
+'''
+@FUSERS.register_module()
+class ConvFuser(nn.Module):
+    def __init__(self, in_channels: List[int], out_channels: int) -> None:
+        super().__init__()
+        
+        # Speichern der Kanäle
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        # Aufbau des Fusionsmoduls als nn.Sequential
+        self.fusion_layers = nn.Sequential(
+            nn.Conv2d(sum(in_channels), out_channels, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        print("Fusion_Layer")
+        for layer in self.fusion_layers:
+            print(layer)
+
+    def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+        print("Starting forward pass in ConvFuser")
+
+        # Konkatenation der Eingaben entlang der Kanal-Dimension
+        concatenated_input = torch.cat(inputs, dim=1)
+        print(f"Concatenated Input Shape: {concatenated_input.shape}")
+
+        # Führen Sie die Fusion durch nn.Sequential aus
+        out = self.fusion_layers(concatenated_input)
+        
+        print(f"Output Shape after ConvFuser: {out.shape}")
+        
+        return out
+
+'''
+
+
+
+
+
+'''
+by Julius
+@FUSERS.register_module()
+class ConvFuser(nn.Module):
+    def __init__(self, in_channels: List[int], out_channels: int) -> None:
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        print("Hallo")
+        print("self.in_channels", self.in_channels)
+        print("self.out_channels", self.out_channels)
+
+
+
+        self.conv = nn.Conv2d(sum(in_channels), out_channels, 3, padding=1, bias=False)
+        print(self.conv)
+
+        self.bn = nn.BatchNorm2d(sum(in_channels))
+
+    def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+        print("Start forward")
+        mask_inp = self.bn(torch.cat(inputs, dim=1))
+        print("Mask input:", mask_inp.mean(), mask_inp.std())
+        mask = self.conv(mask_inp)
+        mask = F.sigmoid(mask)
+        print('Mask:', mask.mean(), mask.std())
+
+        out = inputs[0] * mask + inputs[1] * (1 - mask)
+
+        print("ConvFuser output:", out.shape)
+        return out
+'''
+
+@FUSERS.register_module()
+class BEVOnlyFuser(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+
+        # Speichern der Kanäle für das BEV-Feature und die Zielausgabe
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        # Initialisierung der Convolutional Layer, BatchNorm und ReLU
+        #self.conv = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
+        #self.bn = nn.BatchNorm2d(out_channels)
+        #self.relu = nn.ReLU(True)
+
+    def forward(self, inputs: List[torch.Tensor]) -> torch.Tensor:
+        # Nur das BEV-Feature verwenden (das erste Feature in der Liste)
+        bev_embed = inputs[0]  # Das BEV-Feature (Feature 0)
+
+        # Durch den Convolutional Layer, BatchNorm und ReLU führen
+        #bev_embed = self.conv(bev_embed)
+        #bev_embed = self.bn(bev_embed)
+        #bev_embed = self.relu(bev_embed)
+
+        return bev_embed
+
+
 
 
 
@@ -63,6 +385,8 @@ class MapTRPerceptionTransformer(BaseModule):
         super(MapTRPerceptionTransformer, self).__init__(**kwargs)
         if modality == 'fusion':
             self.fuser = build_fuser(fuser) #TODO
+        fuser = {'type': 'CWLFuser', 'in_channels': [256, 256], 'out_channels': 256}
+        self.fuser = build_fuser(fuser)
         self.use_attn_bev = encoder['type'] == 'BEVFormerEncoder'
         self.encoder = build_transformer_layer_sequence(encoder)
         self.decoder = build_transformer_layer_sequence(decoder)
@@ -81,6 +405,7 @@ class MapTRPerceptionTransformer(BaseModule):
         self.two_stage_num_proposals = two_stage_num_proposals
         self.init_layers()
         self.rotate_center = rotate_center
+        print("init wird aufgerufen")
 
     def init_layers(self):
         """Initialize layers of the Detr3DTransformer."""
@@ -97,6 +422,8 @@ class MapTRPerceptionTransformer(BaseModule):
         )
         if self.can_bus_norm:
             self.can_bus_mlp.add_module('norm', nn.LayerNorm(self.embed_dims))
+        print("init_layer wird aufgerufen")
+
 
     def init_weights(self):
         """Initialize the transformer weights."""
@@ -119,6 +446,7 @@ class MapTRPerceptionTransformer(BaseModule):
     def attn_bev_encode(
             self,
             mlvl_feats,
+            # aerial_feats,
             bev_queries,
             bev_h,
             bev_w,
@@ -198,6 +526,7 @@ class MapTRPerceptionTransformer(BaseModule):
             bev_queries,
             feat_flatten,
             feat_flatten,
+            # aerial_feats,
             bev_h=bev_h,
             bev_w=bev_w,
             bev_pos=bev_pos,
@@ -226,6 +555,7 @@ class MapTRPerceptionTransformer(BaseModule):
     def get_bev_features(
             self,
             mlvl_feats,
+            aerial_feats,
             lidar_feat,
             bev_queries,
             bev_h,
@@ -240,6 +570,7 @@ class MapTRPerceptionTransformer(BaseModule):
         if self.use_attn_bev:
             bev_embed = self.attn_bev_encode(
                 mlvl_feats,
+                #aerial_feats,
                 bev_queries,
                 bev_h,
                 bev_w,
@@ -247,6 +578,37 @@ class MapTRPerceptionTransformer(BaseModule):
                 bev_pos=bev_pos,
                 prev_bev=prev_bev,
                 **kwargs)
+            bs = mlvl_feats[0].size(0)
+            bev_embed = bev_embed.view(bs, bev_h, bev_w, -1).permute(0,3,1,2).contiguous()
+            aerial_feats = nn.functional.interpolate(aerial_feats, size=(bev_h,bev_w), mode='bicubic', align_corners=True)
+            
+            # Zeige die Herkunft der Features an
+            print("Anfang in: get_bev_features")
+            print("Feature: BEV Embed")
+            print(f"Shape: {bev_embed.shape}")
+            print(f"Mean: {bev_embed.mean().item():.4f}, Std: {bev_embed.std().item():.4f}")
+            print(f"Min: {bev_embed.min().item():.4f}, Max: {bev_embed.max().item():.4f}")
+
+            # aerial_feats interpolieren
+            print("Feature: Aerial Features")
+            print(f"Shape: {aerial_feats.shape}")
+            print(f"Mean: {aerial_feats.mean().item():.4f}, Std: {aerial_feats.std().item():.4f}")
+            print(f"Min: {aerial_feats.min().item():.4f}, Max: {aerial_feats.max().item():.4f}")
+            print("Ende in: get_bev_features")
+            
+            
+            
+            
+            
+            
+            
+            
+            fused_bev = self.fuser([bev_embed, aerial_feats])
+            fused_bev = fused_bev.flatten(2).permute(0,2,1).contiguous()
+            bev_embed = fused_bev
+
+
+
         else:
             bev_embed = self.lss_bev_encode(
                 mlvl_feats,
@@ -260,12 +622,15 @@ class MapTRPerceptionTransformer(BaseModule):
             fused_bev = self.fuser([bev_embed, lidar_feat])
             fused_bev = fused_bev.flatten(2).permute(0,2,1).contiguous()
             bev_embed = fused_bev
+            print("Feature 3: Lidar Features")
+            print(f"Shape: {lidar_feat.shape}")
 
         return bev_embed
     # TODO apply fp16 to this module cause grad_norm NAN
     # @auto_fp16(apply_to=('mlvl_feats', 'bev_queries', 'object_query_embed', 'prev_bev', 'bev_pos'))
     def forward(self,
                 mlvl_feats,
+                aerial_feats,
                 lidar_feat,
                 bev_queries,
                 object_query_embed,
@@ -316,6 +681,7 @@ class MapTRPerceptionTransformer(BaseModule):
 
         bev_embed = self.get_bev_features(
             mlvl_feats,
+            aerial_feats,
             lidar_feat,
             bev_queries,
             bev_h,

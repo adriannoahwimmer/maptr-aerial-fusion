@@ -36,6 +36,7 @@ class LoadMultiViewImageFromFiles(object):
 
                 - filename (str): Multi-view image filenames.
                 - img (np.ndarray): Multi-view image arrays.
+                - aerialimg (np.ndarray): (Aerial+Map) image of the sample.
                 - img_shape (tuple[int]): Shape of multi-view image arrays.
                 - ori_shape (tuple[int]): Shape of original image arrays.
                 - pad_shape (tuple[int]): Shape of padded image arrays.
@@ -46,14 +47,25 @@ class LoadMultiViewImageFromFiles(object):
         # img is of shape (h, w, c, num_views)
         img = np.stack(
             [mmcv.imread(name, self.color_type) for name in filename], axis=-1)
+        # concat aerial image, map and resize them to singapore image dims. TODO: refactor and add resize scale in config
+        # aerialimg = np.concatenate((mmcv.imread(results['aerialimg_filename'], self.color_type),
+        #                            mmcv.imread(results['aerialmap_filename'], self.color_type)),
+        #                            axis=2)
+        aerialimg = mmcv.imread(results['aerialimg_filename'], self.color_type)
+        # 202,404 for 30x60m / 674,674 for 100x100m
+        # aerialimg = mmcv.imresize(aerialimg, (674, 674), return_scale=False)
+        aerialimg = mmcv.imresize(aerialimg, (202, 404), return_scale=False)
 
         if self.to_float32:
             img = img.astype(np.float32)
+            aerialimg = aerialimg.astype(np.float32)
         results['filename'] = filename
         # unravel to list, see `DefaultFormatBundle` in formating.py
         # which will transpose each image separately and then stack into array
         results['img'] = [img[..., i] for i in range(img.shape[-1])]
+        results['aerialimg'] = aerialimg
         results['img_shape'] = img.shape
+        results['aerialimg_shape'] = aerialimg.shape
         results['ori_shape'] = img.shape
         # Set initial values for default meta_keys
         results['pad_shape'] = img.shape

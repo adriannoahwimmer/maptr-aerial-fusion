@@ -24,6 +24,7 @@ import time
 import os.path as osp
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from projects.mmdet3d_plugin.core.evaluation.eval_hooks import CustomDistEvalHook
+from projects.mmdet3d_plugin.core.logger_hooks import TensorboardCustomLoggerHook
 from projects.mmdet3d_plugin.datasets import custom_build_dataset
 def custom_train_detector(model,
                    dataset,
@@ -90,6 +91,46 @@ def custom_train_detector(model,
             eval_model = MMDataParallel(
                 eval_model.cuda(cfg.gpu_ids[0]), device_ids=cfg.gpu_ids)
 
+    # a = next(iter(data_loaders[0]))
+    # print(a.keys())
+
+    # img = (a['img'].data[0].shape).unsqueeze(1)
+    # img = img[0,0,:,:,:].permute(1,2,0).cpu().numpy()
+    # print(img.shape)
+    # cv2.imwrite('cameraimage.png', img)
+    # test = model(img=a['img'].data[0], aerialimg=a['aerialimg'].data[0], img_metas=a['img_metas'].data[0], gt_bboxes_3d=a['gt_bboxes_3d'].data[0], gt_labels_3d=a['gt_labels_3d'].data[0])
+    # print(test.keys())
+            
+    # val_samples_per_gpu = cfg.data.val.pop('samples_per_gpu', 1)
+    # if val_samples_per_gpu > 1:
+    #     assert False
+    #     # Replace 'ImageToTensor' to 'DefaultFormatBundle'
+    #     cfg.data.val.pipeline = replace_ImageToTensor(
+    #         cfg.data.val.pipeline)
+    # val_dataset = custom_build_dataset(cfg.data.val, dict(test_mode=False))
+
+    # val_dataloader = build_dataloader(
+    #     val_dataset,
+    #     samples_per_gpu=val_samples_per_gpu,
+    #     workers_per_gpu=cfg.data.workers_per_gpu,
+    #     dist=distributed,
+    #     shuffle=False,
+    #     shuffler_sampler=cfg.data.shuffler_sampler,  # dict(type='DistributedGroupSampler'),
+    #     nonshuffler_sampler=cfg.data.nonshuffler_sampler,  # dict(type='DistributedSampler'),
+    # )
+
+    # b = next(iter(val_dataloader))
+    # img = b['img'][0].data[0][0,0]
+    # print(img.shape)
+    # from torchvision import transforms
+    # norm = transforms.Normalize(mean=[-123.675/58.395, -116.28/57.12, -103.53/57.375],
+    #                             std=[1/58.395, 1/57.12, 1/57.375])
+    # img = norm(img)
+    # img = img.permute(1,2,0).cpu().numpy()
+    # img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    # cv2.imwrite('cameraimage.png', img)
+    # import sys
+    # sys.exit()
 
     # build runner
     optimizer = build_optimizer(model, cfg.optimizer)
@@ -177,6 +218,10 @@ def custom_train_detector(model,
         eval_cfg['jsonfile_prefix'] = osp.join('val', cfg.work_dir, time.ctime().replace(' ','_').replace(':','_'))
         eval_hook = CustomDistEvalHook if distributed else EvalHook
         runner.register_hook(eval_hook(val_dataloader, **eval_cfg))
+
+    # custom tensorboard logger hook
+    tb_hook = TensorboardCustomLoggerHook
+    runner.register_hook(tb_hook(interval=cfg.log_config.interval))
 
     # user-defined hooks
     if cfg.get('custom_hooks', None):

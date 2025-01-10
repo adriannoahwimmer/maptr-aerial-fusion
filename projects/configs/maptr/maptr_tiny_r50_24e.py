@@ -71,6 +71,24 @@ model = dict(
         add_extra_convs='on_output',
         num_outs=_num_levels_,
         relu_before_extra_convs=True),
+    aerialimg_backbone=dict(
+        type='ResNet',
+        depth=50,
+        # in_channels=3,
+        # strides=(1, 2, 2, 1),
+        num_stages=4,
+        out_indices=(0, 1, 2, 3),
+        frozen_stages=1,
+        norm_cfg=dict(type='BN', requires_grad=False),
+        norm_eval=True,
+        style='pytorch',
+        init_cfg=dict(type='Pretrained', checkpoint='ckpts/panoptic_fpn_r50_fpn_mstrain_3x_coco_20210824_171155-5650f98b.pth')),
+    aerialimg_neck=dict(
+        type='FPN',
+        in_channels=[256, 512, 1024, 2048],
+        out_channels=256,
+        num_outs=5,
+        init_cfg=dict(type='Pretrained', checkpoint='ckpts/panoptic_fpn_r50_fpn_mstrain_3x_coco_20210824_171155-5650f98b.pth')),
     pts_bbox_head=dict(
         type='MapTRHead',
         bev_h=bev_h_,
@@ -105,10 +123,12 @@ model = dict(
                 transformerlayers=dict(
                     type='BEVFormerLayer',
                     attn_cfgs=[
+                        # self_attn with prev_bev? Doesn't take img_feats so what does this do when temporal settings is set False? find out later...
                         dict(
                             type='TemporalSelfAttention',
                             embed_dims=_dim_,
                             num_levels=1),
+                        # cross_attn
                         dict(
                             type='GeometrySptialCrossAttention',
                             pc_range=point_cloud_range,
@@ -192,8 +212,9 @@ model = dict(
 
 dataset_type = 'CustomNuScenesLocalMapDataset'
 data_root = 'data/nuscenes/'
+aerialdata_root = '/CVT/30x60m/'
 file_client_args = dict(backend='disk')
-
+find_unused_parameters = True # temporary for testing new modules
 
 train_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -205,7 +226,7 @@ train_pipeline = [
     dict(type='RandomScaleImageMultiViewImage', scales=[0.5]),
     dict(type='PadMultiViewImage', size_divisor=32),
     dict(type='DefaultFormatBundle3D', class_names=class_names),
-    dict(type='CustomCollect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'img'])
+    dict(type='CustomCollect3D', keys=['gt_bboxes_3d', 'gt_labels_3d', 'img', 'aerialimg'])
 ]
 
 test_pipeline = [
@@ -224,7 +245,7 @@ test_pipeline = [
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
                 with_label=False),
-            dict(type='CustomCollect3D', keys=['img'])
+            dict(type='CustomCollect3D', keys=['img', 'aerialimg'])
         ])
 ]
 
@@ -234,7 +255,8 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'nuscenes_infos_temporal_train.pkl',
+        aerialdata_root=aerialdata_root,
+        ann_file=data_root + 'nuscenes_infos_temporal_train-original.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -252,8 +274,9 @@ data = dict(
         box_type_3d='LiDAR'),
     val=dict(type=dataset_type,
              data_root=data_root,
-             ann_file=data_root + 'nuscenes_infos_temporal_val.pkl',
-             map_ann_file=data_root + 'nuscenes_map_anns_val.json',
+             aerialdata_root=aerialdata_root,
+             ann_file=data_root + 'nuscenes_infos_temporal_val-original.pkl',
+             map_ann_file=data_root + 'nuscenes_map_anns_val-original_30x60.json',
              pipeline=test_pipeline,  bev_size=(bev_h_, bev_w_),
              pc_range=point_cloud_range,
              fixed_ptsnum_per_line=fixed_ptsnum_per_gt_line,
@@ -263,8 +286,9 @@ data = dict(
              classes=class_names, modality=input_modality, samples_per_gpu=1),
     test=dict(type=dataset_type,
               data_root=data_root,
-              ann_file=data_root + 'nuscenes_infos_temporal_val.pkl',
-              map_ann_file=data_root + 'nuscenes_map_anns_val.json',
+              aerialdata_root=aerialdata_root,
+              ann_file=data_root + 'nuscenes_infos_temporal_val-original.pkl',
+              map_ann_file=data_root + 'nuscenes_map_anns_val-original_30x60.json',
               pipeline=test_pipeline, bev_size=(bev_h_, bev_w_),
               pc_range=point_cloud_range,
               fixed_ptsnum_per_line=fixed_ptsnum_per_gt_line,
@@ -304,7 +328,7 @@ log_config = dict(
     interval=50,
     hooks=[
         dict(type='TextLoggerHook'),
-        dict(type='TensorboardLoggerHook')
+        # dict(type='TensorboardCustomLoggerHook')
     ])
-fp16 = dict(loss_scale=512.)
+# fp16 = dict(loss_scale=512.)
 checkpoint_config = dict(interval=1)

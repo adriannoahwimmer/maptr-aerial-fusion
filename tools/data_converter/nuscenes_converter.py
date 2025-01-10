@@ -32,6 +32,7 @@ def create_nuscenes_infos(root_path,
                           can_bus_root_path,
                           info_prefix,
                           version='v1.0-trainval',
+                          custom_split = None,
                           max_sweeps=10):
     """Create info file of nuscene dataset.
 
@@ -54,8 +55,12 @@ def create_nuscenes_infos(root_path,
     available_vers = ['v1.0-trainval', 'v1.0-test', 'v1.0-mini']
     assert version in available_vers
     if version == 'v1.0-trainval':
-        train_scenes = splits.train
-        val_scenes = splits.val
+        if custom_split is None:
+            train_scenes = splits.train
+            val_scenes = splits.val
+        else:
+            train_scenes = custom_split.train
+            val_scenes = custom_split.val
     elif version == 'v1.0-test':
         train_scenes = splits.test
         val_scenes = []
@@ -65,6 +70,7 @@ def create_nuscenes_infos(root_path,
     else:
         raise ValueError('unknown')
 
+    print(f'---------- Creating data splits; TRAIN {len(train_scenes)}, VAL {len(val_scenes)} ----------')
     # filter existing scenes.
     available_scenes = get_available_scenes(nusc)
     available_scene_names = [s['name'] for s in available_scenes]
@@ -95,18 +101,18 @@ def create_nuscenes_infos(root_path,
         print('test sample: {}'.format(len(train_nusc_infos)))
         data = dict(infos=train_nusc_infos, metadata=metadata)
         info_path = osp.join(out_path,
-                             '{}_infos_temporal_test.pkl'.format(info_prefix))
+                             '{}_infos_temporal_test-original.pkl'.format(info_prefix))
         mmcv.dump(data, info_path)
     else:
         print('train sample: {}, val sample: {}'.format(
             len(train_nusc_infos), len(val_nusc_infos)))
         data = dict(infos=train_nusc_infos, metadata=metadata)
         info_path = osp.join(out_path,
-                             '{}_infos_temporal_train.pkl'.format(info_prefix))
+                             '{}_infos_temporal_train-original.pkl'.format(info_prefix))
         mmcv.dump(data, info_path)
         data['infos'] = val_nusc_infos
         info_val_path = osp.join(out_path,
-                                 '{}_infos_temporal_val.pkl'.format(info_prefix))
+                                 '{}_infos_temporal_val-original.pkl'.format(info_prefix))
         mmcv.dump(data, info_val_path)
 
 
@@ -200,7 +206,8 @@ def _fill_trainval_infos(nusc,
     val_nusc_infos = []
     frame_idx = 0
     for sample in mmcv.track_iter_progress(nusc.sample):
-        map_location = nusc.get('log', nusc.get('scene', sample['scene_token'])['log_token'])['location']
+        scene = nusc.get('scene', sample['scene_token'])
+        map_location = nusc.get('log', scene['log_token'])['location']
 
         lidar_token = sample['data']['LIDAR_TOP']
         sd_rec = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
@@ -223,6 +230,7 @@ def _fill_trainval_infos(nusc,
             'cams': dict(),
             'map_location': map_location,
             'scene_token': sample['scene_token'],  # temporal related info
+            'scene_name': scene['name'],
             'lidar2ego_translation': cs_record['translation'],
             'lidar2ego_rotation': cs_record['rotation'],
             'ego2global_translation': pose_record['translation'],

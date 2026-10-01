@@ -75,14 +75,14 @@ def nuscenes_data_prep(root_path,
 
     if version == 'v1.0-test':
         info_test_path = osp.join(
-            out_dir, f'{info_prefix}_infos_temporal_test-original.pkl')
+            out_dir, f'{info_prefix}_infos_temporal_test.pkl')
         nuscenes_converter.export_2d_annotation(
             root_path, info_test_path, version=version)
     else:
         info_train_path = osp.join(
-            out_dir, f'{info_prefix}_infos_temporal_train-original.pkl')
+            out_dir, f'{info_prefix}_infos_temporal_train.pkl')
         info_val_path = osp.join(
-            out_dir, f'{info_prefix}_infos_temporal_val-original.pkl')
+            out_dir, f'{info_prefix}_infos_temporal_val.pkl')
         nuscenes_converter.export_2d_annotation(
             root_path, info_train_path, version=version)
         nuscenes_converter.export_2d_annotation(
@@ -228,14 +228,14 @@ parser.add_argument('--extra-tag', type=str, default='kitti')
 parser.add_argument(
     '--workers', type=int, default=4, help='number of threads to be used')
 parser.add_argument(
-    '--custom_split', type=bool, default=False, required=False, help='custom trainval split'
-    )
+    '--custom_split', action='store_true',
+    help='use a custom train/val split instead of the nuScenes default')
 parser.add_argument(
-    '--trainsplit', type=str, default=None, required=False, help='custom train split'
-    )
+    '--trainsplit', type=str, default=None,
+    help='text file with one train scene name per line, e.g. splits/train-v1.txt')
 parser.add_argument(
-    '--valsplit', type=str, default=None, required=False, help='custom val split'
-    )
+    '--valsplit', type=str, default=None,
+    help='text file with one val scene name per line, e.g. splits/val-v1.txt')
 args = parser.parse_args()
 
 if __name__ == '__main__':
@@ -246,9 +246,9 @@ if __name__ == '__main__':
             train = []
             val = []
         with open(args.trainsplit, 'r') as a:
-            customsplit.train = a.read().split('\n')
+            customsplit.train = a.read().split()
         with open(args.valsplit, 'r') as b:
-            customsplit.val = b.read().split('\n')
+            customsplit.val = b.read().split()
     else:
         customsplit = None
     if args.dataset == 'kitti':

@@ -1,3 +1,6 @@
+# MapTR-tiny (R50, 24 epochs) + fusion with aerial images.
+# Best model of the bachelor thesis: "GD: CWH pre-trained Xavier FS: BCWH"
+# (static fusion, CWLFuser). Variants: see the other configs in this folder.
 _base_ = [
     '../datasets/custom_nus-3d.py',
     '../_base_/default_runtime.py'
@@ -71,11 +74,10 @@ model = dict(
         add_extra_convs='on_output',
         num_outs=_num_levels_,
         relu_before_extra_convs=True),
+    # second branch for the aerial images (ResNet-50 + FPN)
     aerialimg_backbone=dict(
         type='ResNet',
         depth=50,
-        # in_channels=3,
-        # strides=(1, 2, 2, 1),
         num_stages=4,
         out_indices=(0, 1, 2, 3),
         frozen_stages=1,
@@ -110,6 +112,13 @@ model = dict(
         code_weights=[1.0, 1.0, 1.0, 1.0],
         transformer=dict(
             type='MapTRPerceptionTransformer',
+            # fusion of BEV features and aerial features
+            aerial_fuser=dict(
+                type='CWLFuser',
+                in_channels=[_dim_, _dim_],
+                out_channels=_dim_,
+                width=bev_h_,
+                length=bev_w_),
             rotate_prev_bev=True,
             use_shift=True,
             use_can_bus=True,
@@ -123,12 +132,10 @@ model = dict(
                 transformerlayers=dict(
                     type='BEVFormerLayer',
                     attn_cfgs=[
-                        # self_attn with prev_bev? Doesn't take img_feats so what does this do when temporal settings is set False? find out later...
                         dict(
                             type='TemporalSelfAttention',
                             embed_dims=_dim_,
                             num_levels=1),
-                        # cross_attn
                         dict(
                             type='GeometrySptialCrossAttention',
                             pc_range=point_cloud_range,
@@ -211,10 +218,11 @@ model = dict(
             pc_range=point_cloud_range))))
 
 dataset_type = 'CustomNuScenesLocalMapDataset'
-data_root = '/disk/no_backup/qo691/MapTR/map_ann_file/'
+data_root = 'data/nuscenes/'
+# aerial images: <aerialdata_root>/<scene_name>/aerial_<sample_token>.png (30 x 60 m)
 aerialdata_root = 'data/nuscenes/aerial/30x60m/'
 file_client_args = dict(backend='disk')
-find_unused_parameters = True # temporary for testing new modules
+find_unused_parameters = True
 
 train_pipeline = [
     dict(type='LoadMultiViewImageFromFiles', to_float32=True),
@@ -250,13 +258,13 @@ test_pipeline = [
 ]
 
 data = dict(
-    samples_per_gpu=2, #4
-    workers_per_gpu=2, #4
+    samples_per_gpu=4,
+    workers_per_gpu=4,
     train=dict(
         type=dataset_type,
         data_root=data_root,
         aerialdata_root=aerialdata_root,
-        ann_file=data_root + 'nuscenes_infos_temporal_train-original_modified_adrian.pkl',
+        ann_file=data_root + 'nuscenes_infos_temporal_train.pkl',
         pipeline=train_pipeline,
         classes=class_names,
         modality=input_modality,
@@ -275,8 +283,8 @@ data = dict(
     val=dict(type=dataset_type,
              data_root=data_root,
              aerialdata_root=aerialdata_root,
-             ann_file=data_root + 'nuscenes_infos_temporal_val-original_modified_adrian.pkl',
-             map_ann_file=data_root + 'nuscenes_map_anns_val-original_30x60.json',
+             ann_file=data_root + 'nuscenes_infos_temporal_val.pkl',
+             map_ann_file=data_root + 'nuscenes_map_anns_val.json',
              pipeline=test_pipeline,  bev_size=(bev_h_, bev_w_),
              pc_range=point_cloud_range,
              fixed_ptsnum_per_line=fixed_ptsnum_per_gt_line,
@@ -287,8 +295,8 @@ data = dict(
     test=dict(type=dataset_type,
               data_root=data_root,
               aerialdata_root=aerialdata_root,
-              ann_file=data_root + 'nuscenes_infos_temporal_val-original.pkl',
-              map_ann_file=data_root + 'nuscenes_map_anns_val-original_30x60.json',
+              ann_file=data_root + 'nuscenes_infos_temporal_val.pkl',
+              map_ann_file=data_root + 'nuscenes_map_anns_val.json',
               pipeline=test_pipeline, bev_size=(bev_h_, bev_w_),
               pc_range=point_cloud_range,
               fixed_ptsnum_per_line=fixed_ptsnum_per_gt_line,
@@ -309,7 +317,9 @@ optimizer = dict(
         }),
     weight_decay=0.01)
 
-optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
+# effective batch size 32: mini-batch 4 x 8 accumulated iterations (thesis 5.5)
+optimizer_config = dict(type='GradientCumulativeOptimizerHook', cumulative_iters=8,
+                        grad_clip=dict(max_norm=35, norm_type=2))
 # learning policy
 lr_config = dict(
     policy='CosineAnnealing',
@@ -318,8 +328,6 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3)
 total_epochs = 24
-# total_epochs = 50
-# evaluation = dict(interval=1, pipeline=test_pipeline)
 evaluation = dict(interval=2, pipeline=test_pipeline, metric='chamfer')
 
 runner = dict(type='EpochBasedRunner', max_epochs=total_epochs)
@@ -328,7 +336,12 @@ log_config = dict(
     interval=50,
     hooks=[
         dict(type='TextLoggerHook'),
-        # dict(type='TensorboardCustomLoggerHook')
+        # TensorboardCustomLoggerHook is registered in custom_train_detector
     ])
-# fp16 = dict(loss_scale=512.)
 checkpoint_config = dict(interval=1)
+
+# "pre-trained": start from a trained MapTR-tiny baseline (camera only) and
+# only train the aerial branch and the fuser (see tools/train.py)
+load_from_maptr = 'ckpts/maptr_tiny_r50_24e.pth'
+trainable_modules = ['aerialimg_backbone', 'aerialimg_neck',
+                     'pts_bbox_head.transformer.fuser']

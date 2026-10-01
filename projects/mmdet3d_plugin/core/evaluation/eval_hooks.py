@@ -75,7 +75,7 @@ class CustomDistEvalHook(BaseDistEvalHook):
 
         from projects.mmdet3d_plugin.bevformer.apis.test import custom_multi_gpu_test # to solve circlur  import
 
-        results, predimg = custom_multi_gpu_test(
+        results = custom_multi_gpu_test(
             runner.model,
             self.dataloader,
             tmpdir=tmpdir,
@@ -84,7 +84,11 @@ class CustomDistEvalHook(BaseDistEvalHook):
             print('\n')
             runner.log_buffer.output['eval_iter_num'] = len(self.dataloader)
 
-            runner.log_buffer.output['valimg'] = predimg
+            # prediction image of the last validation sample (aerial fusion only)
+            model = runner.model.module if hasattr(runner.model, 'module') else runner.model
+            predimg = getattr(model, 'last_pred_img', None)
+            if predimg is not None:
+                runner.log_buffer.output['valimg'] = predimg
             key_score = self.evaluate(runner, results)
 
             if self.save_best:

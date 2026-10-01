@@ -212,102 +212,24 @@ def main():
     meta['seed'] = args.seed
     meta['exp_name'] = osp.basename(args.config)
 
-    print("0")
-
     model = build_model(
         cfg.model,
         train_cfg=cfg.get('train_cfg'),
         test_cfg=cfg.get('test_cfg'))
     model.init_weights()
-    print("2")
 
-
-    # Liste von Beispielparametern und deren Namen aus verschiedenen Komponenten
-    example_params = {
-        "img_backbone.conv1.weight": model.img_backbone.conv1.weight,
-        "img_backbone.layer1.0.conv1.weight": model.img_backbone.layer1[0].conv1.weight,
-        "img_backbone.layer2.0.conv1.weight": model.img_backbone.layer2[0].conv1.weight,
-        "img_backbone.layer3.0.conv1.weight": model.img_backbone.layer3[0].conv1.weight,
-        "img_backbone.layer4.0.conv1.weight": model.img_backbone.layer4[0].conv1.weight,
-        "img_neck.fpn_convs.0.conv.weight": model.img_neck.fpn_convs[0].conv.weight,
-        "aerialimg_backbone.layer1.0.conv1.weight": model.aerialimg_backbone.layer1[0].conv1.weight,
-        "aerialimg_backbone.layer2.0.conv1.weight": model.aerialimg_backbone.layer2[0].conv1.weight,
-        "aerialimg_neck.fpn_convs.0.conv.weight": model.aerialimg_neck.fpn_convs[0].conv.weight,
-    }
-    
-    # Ausgabe der Beispielgewichte vor dem Laden des Checkpoints
-    for name, param in example_params.items():
-        print(f"Vor load_checkpoint: {name} = {param.flatten()[0].item()}")
-
-
-    load_checkpoint(model, '/disk/vanishing_data/qo691/MapTR/work_dirs/maptr_tiny_r50_24e_baseline_noaerial_withaccumulation_byRupert/epoch_24.pth', map_location='cpu')
-    
-    
-    # Ausgabe der gleichen Gewichte nach dem Laden des Checkpoints
-    for name, param in example_params.items():
-        print(f"Nach load_checkpoint: {name} = {param.flatten()[0].item()}") 
-
-
-       
-    
-    
-    print("3")
-    for param in model.parameters():
-        param.requires_grad = False
-
-    # set backbone grads to true
-    for param in model.aerialimg_backbone.parameters():
-        param.requires_grad = True
-    # Activate gradients for aerialimg_neck
-    for param in model.aerialimg_neck.parameters():
-        param.requires_grad = True
-
-    # Pts_bbox
-    for param in model.pts_bbox_head.loss_cls.parameters():
-        param.requires_grad = True
-    for param in model.pts_bbox_head.loss_bbox.parameters():
-        param.requires_grad = True
-    for param in model.pts_bbox_head.loss_iou.parameters():
-        param.requires_grad = True
-    for param in model.pts_bbox_head.loss_pts.parameters():
-        param.requires_grad = True
-    for param in model.pts_bbox_head.loss_dir.parameters():
-        param.requires_grad = True
-
-
-    # Stelle sicher, dass `fusion_weight_tensor` trainierbar ist
-    #model.pts_bbox_head.transformer.fuser.fusion_weight_tensor.requires_grad = True
-
-
-    # Stelle sicher, dass die Parameter der dynamic_conv trainierbar sind
-    for param in model.pts_bbox_head.transformer.fuser.dynamic_conv.parameters():
-        param.requires_grad = True
-        print(model.pts_bbox_head.transformer.fuser.dynamic_conv)
-
-    for name, param in model.named_parameters():
-        if param.requires_grad and "dynamic_conv" in name:
-            print(f"{name} grad: {param.grad}")
-
-
-  
-        
-
-
-    print("4")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    # "pre-trained" setting of the aerial fusion experiments: start from a
+    # trained MapTR baseline and only train the modules in `trainable_modules`
+    if cfg.get('load_from_maptr', None):
+        logger.info(f'Load MapTR weights from {cfg.load_from_maptr}')
+        load_checkpoint(model, cfg.load_from_maptr, map_location='cpu')
+    if cfg.get('trainable_modules', None):
+        for name, param in model.named_parameters():
+            param.requires_grad = any(
+                name.startswith(prefix) for prefix in cfg.trainable_modules)
+        num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f'Trainable modules: {cfg.trainable_modules} '
+                    f'({num_trainable} parameters)')
 
     logger.info(f'Model:\n{model}')
     datasets = [build_dataset(cfg.data.train)]
@@ -344,8 +266,6 @@ def main():
         validate=(not args.no_validate),
         timestamp=timestamp,
         meta=meta)
-
-    print("E")    
 
 
 if __name__ == '__main__':

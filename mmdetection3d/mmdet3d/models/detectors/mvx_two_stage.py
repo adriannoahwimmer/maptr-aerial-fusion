@@ -26,10 +26,8 @@ class MVXTwoStageDetector(Base3DDetector):
                  pts_middle_encoder=None,
                  pts_fusion_layer=None,
                  img_backbone=None,
-                 aerialimg_backbone=None,
                  pts_backbone=None,
                  img_neck=None,
-                 aerialimg_neck=None,
                  pts_neck=None,
                  pts_bbox_head=None,
                  img_roi_head=None,
@@ -37,7 +35,9 @@ class MVXTwoStageDetector(Base3DDetector):
                  train_cfg=None,
                  test_cfg=None,
                  pretrained=None,
-                 init_cfg=None):
+                 init_cfg=None,
+                 aerialimg_backbone=None,
+                 aerialimg_neck=None):
         super(MVXTwoStageDetector, self).__init__(init_cfg=init_cfg)
 
         if pts_voxel_layer:
@@ -95,8 +95,6 @@ class MVXTwoStageDetector(Base3DDetector):
                     key, please consider using init_cfg')
                 self.img_backbone.init_cfg = dict(
                     type='Pretrained', checkpoint=img_pretrained)
-                # self.aerialimg_backbone.init_cfg = dict(
-                #     type='Pretrained', checkpoint=img_pretrained)
         if self.with_img_roi_head:
             if img_pretrained is not None:
                 warnings.warn('DeprecationWarning: pretrained is a deprecated \

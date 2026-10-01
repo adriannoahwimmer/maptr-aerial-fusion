@@ -1,7 +1,10 @@
 /*.sh
 change_submit.py
 cluster_submit.yaml
-.pkl
+
+# info files and checkpoints
+*.pkl
+*.pth
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

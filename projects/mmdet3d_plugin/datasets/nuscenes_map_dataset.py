@@ -904,7 +904,6 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
     """
     MAPCLASSES = ('divider',)
     def __init__(self,
-                 aerialdata_root,
                  map_ann_file=None, 
                  queue_length=4, 
                  bev_size=(200, 200), 
@@ -916,11 +915,13 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
                  map_classes=None,
                  noise='None',
                  noise_std=0,
+                 aerialdata_root=None,
                  *args, 
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.map_ann_file = map_ann_file
-        self.aerialdata_root = aerialdata_root 
+        # folder with aerial images: <aerialdata_root>/<scene_name>/aerial_<sample_token>.png
+        self.aerialdata_root = aerialdata_root
         self.queue_length = queue_length
         self.overlap_test = overlap_test
         self.bev_size = bev_size
@@ -1111,7 +1112,7 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
             prev_idx=info['prev'],
             next_idx=info['next'],
             scene_token=info['scene_token'],
-            scene_name=info['scene_name'],
+            scene_name=info.get('scene_name'),
             can_bus=info['can_bus'],
             frame_idx=info['frame_idx'],
             timestamp=info['timestamp'],
@@ -1124,8 +1125,11 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
         input_dict["lidar2ego"] = lidar2ego
         if self.modality['use_camera']:
             image_paths = []
-            aerialimg_path = os.path.join(self.aerialdata_root, input_dict['scene_name'], 'aerial_{}.png'.format(info['token']))
-            aerialmap_path = os.path.join(self.aerialdata_root, input_dict['scene_name'], 'map_{}.png'.format(info['token']))
+            aerialimg_path = None
+            if self.aerialdata_root is not None:
+                assert input_dict['scene_name'] is not None, \
+                    'aerial fusion needs `scene_name` in the info files, recreate them with tools/create_data.py'
+                aerialimg_path = os.path.join(self.aerialdata_root, input_dict['scene_name'], 'aerial_{}.png'.format(info['token']))
             lidar2img_rts = []
             lidar2cam_rts = []
             cam_intrinsics = []
@@ -1174,7 +1178,6 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
                 dict(
                     img_filename=image_paths,
                     aerialimg_filename=aerialimg_path,
-                    aerialmap_filename=aerialmap_path,
                     lidar2img=lidar2img_rts,
                     cam_intrinsic=cam_intrinsics,
                     lidar2cam=lidar2cam_rts,

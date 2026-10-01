@@ -48,10 +48,11 @@ class MapTR(MVXTwoStageDetector):
         super(MapTR,
               self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
-                             img_backbone, aerialimg_backbone, pts_backbone,
-                             img_neck, aerialimg_neck, pts_neck,
+                             img_backbone, pts_backbone, img_neck, pts_neck,
                              pts_bbox_head, img_roi_head, img_rpn_head,
-                             train_cfg, test_cfg, pretrained)
+                             train_cfg, test_cfg, pretrained,
+                             aerialimg_backbone=aerialimg_backbone,
+                             aerialimg_neck=aerialimg_neck)
         self.grid_mask = GridMask(
             True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         self.use_grid_mask = use_grid_mask
@@ -79,22 +80,51 @@ class MapTR(MVXTwoStageDetector):
             )
             self.voxelize_reduce = lidar_encoder.get("voxelize_reduce", True)
 
-        # conv layers for fusing feature pyramids
-        self.lateral_convs = nn.ModuleList()
-        for i in range(5):
-            self.lateral_convs.append(
-                ConvModule(
-                    256,
-                    256,
-                    1,
-                    conv_cfg=None,
-                    norm_cfg=None,
-                    inplace=False))
+        if self.with_aerialimg:
+            # 1x1 conv layers for merging the levels of the aerial feature pyramid
+            self.lateral_convs = nn.ModuleList()
+            for i in range(5):
+                self.lateral_convs.append(
+                    ConvModule(
+                        256,
+                        256,
+                        1,
+                        conv_cfg=None,
+                        norm_cfg=None,
+                        inplace=False))
 
-    def extract_img_feat(self, img, aerialimg, img_metas, len_queue=None):
-        """Extract features of images."""
+    @property
+    def with_aerialimg(self):
+        """bool: Whether the detector has a branch for aerial images."""
+        return getattr(self, 'aerialimg_backbone', None) is not None
+
+    def extract_aerial_feat(self, aerialimg):
+        """Extract aerial features and merge the FPN levels into one map.
+
+        Similar to the FusedSemanticHead of S2A-Net
+        (https://github.com/csuhan/s2anet/blob/master/mmdet/models/mask_heads/fused_semantic_head.py#L11).
+        E.g. levels of shape [4, 256, 101, 51], [4, 256, 51, 26], [4, 256, 26, 13],
+        [4, 256, 13, 7], [4, 256, 7, 4] are resized to the first level and summed.
+        """
+        aerial_feats = self.aerialimg_backbone(aerialimg)
+        if self.with_img_neck:
+            aerial_feats = self.aerialimg_neck(aerial_feats)
+
+        fusion_level = 0
+        x = self.lateral_convs[fusion_level](aerial_feats[fusion_level])
+        fused_size = tuple(x.shape[-2:])
+        for i, feat in enumerate(aerial_feats):
+            if i != fusion_level:
+                feat = F.interpolate(
+                    feat, size=fused_size, mode='bilinear', align_corners=True)
+                add = self.lateral_convs[i](feat) # autograd issue with inplace operation
+                x = x+add
+        return x
+
+    def extract_img_feat(self, img, img_metas, len_queue=None, aerialimg=None):
+        """Extract features of camera images and (optionally) aerial images."""
         B = img.size(0)
-        if img is not None and aerialimg is not None:
+        if img is not None:
             
             # input_shape = img.shape[-2:]
             # # update real input shape of each single img
@@ -110,33 +140,16 @@ class MapTR(MVXTwoStageDetector):
                 img = self.grid_mask(img)
 
             img_feats = self.img_backbone(img)
-            aerial_feats = self.aerialimg_backbone(aerialimg)
             if isinstance(img_feats, dict):
                 img_feats = list(img_feats.values())
         else:
             return None, None
         if self.with_img_neck:
             img_feats = self.img_neck(img_feats)
-            aerial_feats = self.aerialimg_neck(aerial_feats)
 
-        '''FusedSemanticHead (https://github.com/csuhan/s2anet/blob/master/mmdet/models/mask_heads/fused_semantic_head.py#L11)
-        eg: aerial_feats is a list of shapes:
-            torch.Size([4, 256, 101, 51]) 0
-            torch.Size([4, 256, 51, 26])  1
-            torch.Size([4, 256, 26, 13])  2
-            torch.Size([4, 256, 13, 7])  3
-            torch.Size([4, 256, 7, 4])  4
-        '''
-        fusion_level = 0
-        x = self.lateral_convs[fusion_level](aerial_feats[fusion_level])
-        fused_size = tuple(x.shape[-2:])
-        for i, feat in enumerate(aerial_feats):
-            if i != fusion_level:
-                feat = F.interpolate(
-                    feat, size=fused_size, mode='bilinear', align_corners=True)
-                add = self.lateral_convs[i](feat) # autograd issue with inplace operation
-                x = x+add
-        aerial_feats = x
+        aerial_feats = None
+        if self.with_aerialimg and aerialimg is not None:
+            aerial_feats = self.extract_aerial_feat(aerialimg)
 
         img_feats_reshaped = []
         for img_feat in img_feats:
@@ -148,23 +161,28 @@ class MapTR(MVXTwoStageDetector):
         return img_feats_reshaped, aerial_feats
 
     @auto_fp16(apply_to=('img'), out_fp32=True)
-    def extract_feat(self, img, aerialimg, img_metas=None, len_queue=None):
-        """Extract features from images and points."""
+    def extract_feat(self, img, img_metas=None, len_queue=None, aerialimg=None):
+        """Extract features from images and points.
 
-        img_feats, aerial_feats = self.extract_img_feat(img, aerialimg, img_metas, len_queue=len_queue)
-        
+        Returns:
+            tuple: Camera features and aerial features (None without aerial branch).
+        """
+
+        img_feats, aerial_feats = self.extract_img_feat(
+            img, img_metas, len_queue=len_queue, aerialimg=aerialimg)
+
         return img_feats, aerial_feats
 
 
     def forward_pts_train(self,
                           pts_feats,
-                          aerial_feats,
                           lidar_feat,
                           gt_bboxes_3d,
                           gt_labels_3d,
                           img_metas,
                           gt_bboxes_ignore=None,
-                          prev_bev=None):
+                          prev_bev=None,
+                          aerial_feats=None):
         """Forward function'
         Args:
             pts_feats (list[torch.Tensor]): Features of point cloud branch
@@ -176,12 +194,13 @@ class MapTR(MVXTwoStageDetector):
             gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
                 boxes to be ignored. Defaults to None.
             prev_bev (torch.Tensor, optional): BEV features of previous frame.
+            aerial_feats (torch.Tensor, optional): Aerial image features.
         Returns:
-            dict: Losses of each branch.
+            tuple: Losses of each branch and the raw head outputs.
         """
 
         outs = self.pts_bbox_head(
-            pts_feats, aerial_feats, lidar_feat, img_metas, prev_bev)
+            pts_feats, lidar_feat, img_metas, prev_bev, aerial_feats=aerial_feats)
         loss_inputs = [gt_bboxes_3d, gt_labels_3d, outs]
         losses = self.pts_bbox_head.loss(*loss_inputs, img_metas=img_metas)
         return losses, outs
@@ -214,7 +233,7 @@ class MapTR(MVXTwoStageDetector):
             prev_bev = None
             bs, len_queue, num_cams, C, H, W = imgs_queue.shape
             imgs_queue = imgs_queue.reshape(bs*len_queue, num_cams, C, H, W)
-            img_feats_list = self.extract_feat(img=imgs_queue, len_queue=len_queue)
+            img_feats_list, _ = self.extract_feat(img=imgs_queue, len_queue=len_queue)
             for i in range(len_queue):
                 img_metas = [each[i] for each in img_metas_list]
                 if not img_metas[0]['prev_bev_exists']:
@@ -318,29 +337,29 @@ class MapTR(MVXTwoStageDetector):
         img_metas = [each[len_queue-1] for each in img_metas]
         if not img_metas[0]['prev_bev_exists']:
             prev_bev = None
-        img_feats, aerial_feats = self.extract_feat(img=img, aerialimg=aerialimg, img_metas=img_metas)
+        img_feats, aerial_feats = self.extract_feat(img=img, img_metas=img_metas, aerialimg=aerialimg)
         losses = dict()
-        losses_pts, outs = self.forward_pts_train(img_feats, aerial_feats, lidar_feat, gt_bboxes_3d,
+        losses_pts, outs = self.forward_pts_train(img_feats, lidar_feat, gt_bboxes_3d,
                                             gt_labels_3d, img_metas,
-                                            gt_bboxes_ignore, prev_bev)
+                                            gt_bboxes_ignore, prev_bev,
+                                            aerial_feats=aerial_feats)
 
         losses.update(losses_pts)
 
-        # put the images to be logged here -->
-        with torch.no_grad():
-            ret_bbox_list = [dict() for i in range(len(img_metas))]
-            bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas, rescale=True)
+        # image (cameras, aerial image, prediction) for the Tensorboard logger
+        if aerialimg is not None:
+            with torch.no_grad():
+                ret_bbox_list = [dict() for i in range(len(img_metas))]
+                bbox_list = self.pts_bbox_head.get_bboxes(outs, img_metas, rescale=True)
 
-            bbox_results = [
-            self.pred2result(bboxes, scores, labels, pts)
-            for bboxes, scores, labels, pts in bbox_list]
+                bbox_results = [
+                self.pred2result(bboxes, scores, labels, pts)
+                for bboxes, scores, labels, pts in bbox_list]
 
-            for result_dict, pts_bbox in zip(ret_bbox_list, bbox_results):
-                result_dict['pts_bbox'] = pts_bbox
+                for result_dict, pts_bbox in zip(ret_bbox_list, bbox_results):
+                    result_dict['pts_bbox'] = pts_bbox
 
-        logimg = pred_img(img, aerialimg, ret_bbox_list, self.pts_bbox_head.pc_range)
-        img_ = {'img': logimg}
-        losses.update(img_)
+            losses['img'] = pred_img(img, aerialimg, ret_bbox_list, self.pts_bbox_head.pc_range)
 
         return losses
 
@@ -371,17 +390,22 @@ class MapTR(MVXTwoStageDetector):
             img_metas[0][0]['can_bus'][-1] = 0
             img_metas[0][0]['can_bus'][:3] = 0
 
-        # simple_test expects the args to be nested in a list... why? no idea...
+        # test time inputs are nested in a list (one entry per augmentation)
+        aerialimg = aerialimg[0] if aerialimg is not None else None
         new_prev_bev, bbox_results = self.simple_test(
-            img_metas[0], img[0], aerialimg[0], points[0], prev_bev=self.prev_frame_info['prev_bev'], **kwargs)
+            img_metas[0], img[0], points[0], prev_bev=self.prev_frame_info['prev_bev'],
+            aerialimg=aerialimg, **kwargs)
         # During inference, we save the BEV features and ego motion of each timestamp.
         self.prev_frame_info['prev_pos'] = tmp_pos
         self.prev_frame_info['prev_angle'] = tmp_angle
         self.prev_frame_info['prev_bev'] = new_prev_bev
-        
+
+        # image for the Tensorboard logger (read by CustomDistEvalHook),
         # EvalHook validates with batch size of 1
-        logimg = pred_img(img[0].unsqueeze(0), aerialimg[0], bbox_results, self.pts_bbox_head.pc_range)
-        return bbox_results, logimg
+        self.last_pred_img = None
+        if aerialimg is not None:
+            self.last_pred_img = pred_img(img[0].unsqueeze(0), aerialimg, bbox_results, self.pts_bbox_head.pc_range)
+        return bbox_results
 
     def pred2result(self, bboxes, scores, labels, pts, attrs=None):
         """Convert detection results to a list of numpy arrays.
@@ -411,9 +435,9 @@ class MapTR(MVXTwoStageDetector):
             result_dict['attrs_3d'] = attrs.cpu()
 
         return result_dict
-    def simple_test_pts(self, x, aerial_feats, lidar_feat, img_metas, prev_bev=None, rescale=False):
+    def simple_test_pts(self, x, lidar_feat, img_metas, prev_bev=None, rescale=False, aerial_feats=None):
         """Test function"""
-        outs = self.pts_bbox_head(x, aerial_feats, lidar_feat, img_metas, prev_bev=prev_bev)
+        outs = self.pts_bbox_head(x, lidar_feat, img_metas, prev_bev=prev_bev, aerial_feats=aerial_feats)
 
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
@@ -424,16 +448,16 @@ class MapTR(MVXTwoStageDetector):
         ]
         # import pdb;pdb.set_trace()
         return outs['bev_embed'], bbox_results
-    def simple_test(self, img_metas, img=None, aerialimg=None, points=None, prev_bev=None, rescale=False, **kwargs):
+    def simple_test(self, img_metas, img=None, points=None, prev_bev=None, rescale=False, aerialimg=None, **kwargs):
         """Test function without augmentaiton."""
         lidar_feat = None
         if self.modality =='fusion':
             lidar_feat = self.extract_lidar_feat(points)
-        img_feats, aerial_feats = self.extract_feat(img=img, aerialimg=aerialimg, img_metas=img_metas)
+        img_feats, aerial_feats = self.extract_feat(img=img, img_metas=img_metas, aerialimg=aerialimg)
 
         bbox_list = [dict() for i in range(len(img_metas))]
         new_prev_bev, bbox_pts = self.simple_test_pts(
-            img_feats, aerial_feats, lidar_feat, img_metas, prev_bev, rescale=rescale)
+            img_feats, lidar_feat, img_metas, prev_bev, rescale=rescale, aerial_feats=aerial_feats)
         for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
             result_dict['pts_bbox'] = pts_bbox
         return new_prev_bev, bbox_list
@@ -509,9 +533,8 @@ class MapTR(MVXTwoStageDetector):
         losses = self(**data)
         loss, log_vars = self._parse_losses(losses)
 
-        # images to be logged
-        img = log_vars['img']
-        del log_vars['img']
+        # image to be logged by TensorboardCustomLoggerHook (if any)
+        img = log_vars.pop('img', None)
 
         outputs = dict(
             loss=loss, log_vars=log_vars, img=img, num_samples=len(data['img_metas']))

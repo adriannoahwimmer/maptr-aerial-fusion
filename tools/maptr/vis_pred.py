@@ -234,7 +234,7 @@ def main():
         #     continue
 
         with torch.no_grad():
-            result, _ = model(return_loss=False, rescale=True, **data)
+            result = model(return_loss=False, rescale=True, **data)
         sample_dir = osp.join(args.show_dir, pts_filename)
         mmcv.mkdir_or_exist(osp.abspath(sample_dir))
 
@@ -380,9 +380,9 @@ def main():
 
 
         plt.imshow(car_img, extent=[-1.2, 1.2, -1.5, 1.5])
-        map_path = osp.join(sample_dir, 'PRED_MAP_plot_' + str(args.score_thresh)+ '.png')
 
-        #map_path = osp.join(sample_dir, 'PRED_MAP_plot.png')
+        # score threshold in the file name, so several thresholds can be compared
+        map_path = osp.join(sample_dir, 'PRED_MAP_plot_' + str(args.score_thresh)+ '.png')
         plt.savefig(map_path, bbox_inches='tight', format='png',dpi=1200)
         plt.close()
 

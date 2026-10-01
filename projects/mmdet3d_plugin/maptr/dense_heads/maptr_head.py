@@ -200,7 +200,7 @@ class MapTRHead(DETRHead):
     
     # @auto_fp16(apply_to=('mlvl_feats'))
     @force_fp32(apply_to=('mlvl_feats', 'prev_bev'))
-    def forward(self, mlvl_feats, aerial_feats, lidar_feat, img_metas, prev_bev=None,  only_bev=False):
+    def forward(self, mlvl_feats, lidar_feat, img_metas, prev_bev=None,  only_bev=False, aerial_feats=None):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -208,6 +208,8 @@ class MapTRHead(DETRHead):
                 (B, N, C, H, W).
             prev_bev: previous bev featues
             only_bev: only compute BEV features with encoder. 
+            aerial_feats (Tensor, optional): Fused aerial image features
+                with shape (B, C, H, W).
         Returns:
             all_cls_scores (Tensor): Outputs from the classification head, \
                 shape [nb_dec, bs, num_query, cls_out_channels]. Note \
@@ -253,7 +255,6 @@ class MapTRHead(DETRHead):
         else:
             outputs = self.transformer(
                 mlvl_feats,
-                aerial_feats,
                 lidar_feat,
                 bev_queries,
                 object_query_embeds,
@@ -265,7 +266,8 @@ class MapTRHead(DETRHead):
                 reg_branches=self.reg_branches if self.with_box_refine else None,  # noqa:E501
                 cls_branches=self.cls_branches if self.as_two_stage else None,
                 img_metas=img_metas,
-                prev_bev=prev_bev
+                prev_bev=prev_bev,
+                aerial_feats=aerial_feats
         )
 
         bev_embed, hs, init_reference, inter_references = outputs
